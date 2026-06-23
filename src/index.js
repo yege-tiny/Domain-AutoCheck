@@ -10,7 +10,7 @@ import { connect } from 'cloudflare:sockets';
 // 环境变量声明（运行时由 injectEnv 注入）
 let DOMAIN_MONITOR, TOKEN, SITE_NAME, LOGO_URL,
     BACKGROUND_URL, MOBILE_BACKGROUND_URL,
-    TG_TOKEN, TG_ID, WHOISJSON_API_KEY;
+    TG_TOKEN, TG_ID;
 
 // 将环境变量注入模块作用域，使已有的 typeof VAR !== 'undefined' 检查继续工作
 function injectEnv(env) {
@@ -22,7 +22,6 @@ function injectEnv(env) {
 	if (env.MOBILE_BACKGROUND_URL !== undefined) MOBILE_BACKGROUND_URL = env.MOBILE_BACKGROUND_URL;
 	if (env.TG_TOKEN !== undefined) TG_TOKEN = env.TG_TOKEN;
 	if (env.TG_ID !== undefined) TG_ID = env.TG_ID;
-	if (env.WHOISJSON_API_KEY !== undefined) WHOISJSON_API_KEY = env.WHOISJSON_API_KEY;
 }
 
 // ================================
@@ -47,9 +46,6 @@ const DEFAULT_TG_ID = '';    // Telegram聊天ID，外置变量为TG_ID
 
 // 网站标题配置
 const DEFAULT_SITE_NAME = ''; // 默认网站标题，外置变量为SITE_NAME
-
-// WhoisJSON API配置
-const DEFAULT_WHOISJSON_API_KEY = ''; // WhoisJSON API密钥，外置变量为WHOISJSON_API_KEY
 
 // ================================
 // 工具函数区域
@@ -414,62 +410,289 @@ function getWhoisQueryFunction(domainName) {
       lowerDomain.endsWith('.us.kg') || lowerDomain.endsWith('.xx.kg')) {
     return queryDigitalPlatWhois;
   }
-  // 一级域名且配置了WhoisJSON API密钥
+  // 一级域名：RDAP 查询（免费无 Key），所有 gTLD 均可查
   if (dotCount === 1) {
-    const apiKey = typeof WHOISJSON_API_KEY !== 'undefined' ? WHOISJSON_API_KEY : DEFAULT_WHOISJSON_API_KEY;
-    if (apiKey) {
-      return queryDomainWhois;
-    }
+    return queryFirstLevelDomain;
   }
   return null;
 }
 
-// WhoisJSON API查询函数
-async function queryDomainWhois(domain) {
+// 一级域名查询：注册局 RDAP（若有覆盖）> TCP WHOIS（IANA 两跳）> rdap.org 兜底
+//
+// 背景：rdap.org（IETF bootstrap）对 Cloudflare Workers 出口会阻断/限速；部分 ccTLD
+// 的 43 端口 WHOIS（如 whois.ua）也封 Workers。但这些注册局往往有自己的 HTTPS RDAP
+// 服务器（如 .ua 的 rdap.hostmaster.ua），可达且返回标准 RDAP JSON。所以对已知 TLD
+// 优先直连其注册局 RDAP。
+async function queryFirstLevelDomain(domain) {
+  const lower = domain.toLowerCase();
+  const tld = lower.split('.').pop();
+
+  // 1) 已知注册局 RDAP（完整域名 > TLD），直连，绕开会被封的 WHOIS/bootstrap
+  const rdapBase = RDAP_SERVER_OVERRIDE[lower] || RDAP_SERVER_OVERRIDE[tld];
+  if (rdapBase) {
+    const r = await queryGenericRdap(domain, rdapBase);
+    if (r.success) return r;
+  }
+
+  // 2) TCP WHOIS（IANA 两跳）
+  const tcpResult = await queryGenericTcpWhois(domain);
+  if (tcpResult.success) return tcpResult;
+
+  // 3) rdap.org bootstrap 兜底
+  return await queryGenericRdap(domain);
+}
+
+// 通用 socket WHOIS 查询：连 host:43，发送 query，读取全部响应文本（带超时）
+async function _whoisSocketQuery(host, query, timeoutMs) {
+  const socket = connect({ hostname: host, port: 43 });
+  const writer = socket.writable.getWriter();
+  await writer.write(new TextEncoder().encode(query + '\r\n'));
+  writer.releaseLock();
+
+  const reader = socket.readable.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let timedOut = false;
+  const timeoutId = setTimeout(() => { timedOut = true; reader.cancel(); }, timeoutMs);
   try {
-    // 获取API密钥，优先使用环境变量，否则使用默认值
-    const apiKey = typeof WHOISJSON_API_KEY !== 'undefined' ? WHOISJSON_API_KEY : DEFAULT_WHOISJSON_API_KEY;
-    
-    if (!apiKey) {
-      throw new Error('WhoisJSON API密钥未配置');
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch (e) {
+    if (!timedOut) throw e;
+  } finally {
+    clearTimeout(timeoutId);
+    socket.close();
+  }
+  if (timedOut && !text) throw new Error('WHOIS查询超时');
+  return text;
+}
+
+// 已知 WHOIS 服务器覆盖表：某些 ccTLD 注册局（如 whois.ua）封禁 Cloudflare Workers
+// 出口 IP，连接会 "Network connection lost"。这里把这类域名/TLD 强制指向可用的
+// 备用 WHOIS 服务器（通常是该后缀自营的服务器），绕开会被封的官方服务器。
+// key 同时支持「完整域名」和「TLD」，完整域名优先。
+const WHOIS_SERVER_OVERRIDE = {
+};
+
+// 已知注册局 RDAP 覆盖表：某些 ccTLD 的 43 端口 WHOIS 封 Workers，但提供 HTTPS RDAP。
+// 这里把这类 TLD/域名直连其注册局 RDAP（返回标准 RDAP JSON），绕开 whois 与 rdap.org。
+// key 同时支持「完整域名」和「TLD」，完整域名优先。value 是 RDAP base（不含末尾斜杠）。
+const RDAP_SERVER_OVERRIDE = {
+  'ua': 'https://rdap.hostmaster.ua',   // .ua 注册局 RDAP；whois.ua 的 43 端口封 Workers
+};
+
+// 一级域名 TCP WHOIS 查询（IANA 两跳）
+// 第一跳 whois.iana.org 查 TLD 的官方 WHOIS 服务器，第二跳查完整域名。
+async function queryGenericTcpWhois(domain) {
+  try {
+    const lower = domain.toLowerCase();
+    const tld = lower.split('.').pop();
+
+    // 优先用覆盖表（完整域名 > TLD），命中则跳过 IANA 第一跳
+    let whoisServer = WHOIS_SERVER_OVERRIDE[lower] || WHOIS_SERVER_OVERRIDE[tld] || null;
+
+    // 未命中覆盖表 → 第一跳 whois.iana.org 找 TLD 的官方 WHOIS 服务器
+    if (!whoisServer) {
+      const ianaText = await _whoisSocketQuery('whois.iana.org', tld, 10000);
+      const referMatch = ianaText.match(/refer:\s*(\S+)/i) || ianaText.match(/whois:\s*(\S+)/i);
+      whoisServer = referMatch ? referMatch[1].trim() : null;
+      if (!whoisServer) {
+        throw new Error(`未找到 .${tld} 的 WHOIS 服务器`);
+      }
     }
 
-    // 调用WhoisJSON API
-    const response = await fetch(`https://whoisjson.com/api/v1/whois?domain=${encodeURIComponent(domain)}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Token=${apiKey}`,
-        'Content-Type': 'application/json'
+    // 第二跳：查询完整域名
+    const whoisText = await _whoisSocketQuery(whoisServer, domain, 10000);
+
+    // 未注册判断
+    if (/(No match|NOT FOUND|No Data Found|Domain not found|Status:\s*free|No entries found)/i.test(whoisText)) {
+      return {
+        success: true,
+        domain: domain,
+        registered: false,
+        raw: whoisText
+      };
+    }
+
+    // 清洗：去掉注释行（% 或 # 开头）。RIPE/ccTLD（如 .ua）WHOIS 大量用 % 注释和
+    // "% ==========" 分隔线，不过滤会被下面的字段正则误当成字段值。
+    const cleanText = whoisText
+      .split(/\r?\n/)
+      .filter(l => {
+        const t = l.trim();
+        return t && !t.startsWith('%') && !t.startsWith('#');
+      })
+      .join('\n');
+
+    // 字段冒号后用 [^\S\r\n]*（仅同行空白）而非 \s*，避免 \s* 吃掉换行、把下一行内容当成字段值
+    const parseField = (regex) => {
+      const m = cleanText.match(regex);
+      return m ? m[1].trim() : null;
+    };
+
+    // 注册日期：兼容多种 WHOIS 字段写法
+    const createdOn = parseField(/(?:Creation Date|Created On|Created Date|created|Registration Time|Registered on):[^\S\r\n]*([^\r\n]+)/i);
+    // 到期日期：兼容多种写法
+    const expiresOn = parseField(/(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiry Date|Expiration Date|Expiration Time|paid-till|Expires On|expires?):[^\S\r\n]*([^\r\n]+)/i);
+    const updatedOn = parseField(/(?:Updated Date|Last Updated On|Last Modified|changed|modified):[^\S\r\n]*([^\r\n]+)/i);
+    const registrar = parseField(/(?:Sponsoring Registrar|Registrar Name|Registrar|registrar):[^\S\r\n]*([^\r\n]+)/i);
+    const registrarUrl = parseField(/Registrar URL:[^\S\r\n]*([^\r\n]+)/i);
+
+    const nameservers = [];
+    const nsRegex = /(?:Name Server|Nameserver|nserver):[^\S\r\n]*([^\r\n]+)/gi;
+    let m;
+    while ((m = nsRegex.exec(cleanText)) !== null) {
+      const ns = m[1].trim().split(/\s+/)[0];
+      if (ns) nameservers.push(ns.toLowerCase());
+    }
+
+    const statuses = [];
+    const statusRegex = /(?:Domain Status|status):[^\S\r\n]*([^\r\n]+)/gi;
+    while ((m = statusRegex.exec(cleanText)) !== null) {
+      const s = m[1].trim();
+      if (s) statuses.push(s);
+    }
+
+    const dnssec = parseField(/DNSSEC:[^\S\r\n]*([^\r\n]+)/i);
+
+    return {
+      success: true,
+      domain: domain,
+      registered: !!(createdOn || expiresOn),
+      registrationDate: createdOn ? formatDate(createdOn) : null,
+      expiryDate: expiresOn ? formatDate(expiresOn) : null,
+      lastUpdated: updatedOn ? formatDate(updatedOn) : null,
+      registrar: registrar,
+      registrarUrl: registrarUrl,
+      nameservers: [...new Set(nameservers)],
+      status: statuses,
+      dnssec: dnssec,
+      raw: whoisText
+    };
+  } catch (error) {
+    const msg = error.message === 'WHOIS查询超时' ? 'WHOIS查询超时（10秒）' : error.message;
+    console.error('一级域名 TCP WHOIS 查询失败，将尝试 RDAP:', msg);
+    return {
+      success: false,
+      error: msg,
+      domain: domain
+    };
+  }
+}
+
+// 通用 RDAP 查询：默认走 rdap.org（bootstrap），也可传入指定注册局 RDAP base
+// （如 https://rdap.hostmaster.ua）直连。
+//
+// rdap.org 是 IETF bootstrap 服务，会 302 重定向到对应 TLD 注册局的 RDAP 服务器；
+// 在部分 Cloudflare Workers 出口下 rdap.org 可能不可达（被限速/阻断），因此优先用
+// RDAP_SERVER_OVERRIDE 里已知可达的注册局 RDAP。fetch 没有内建超时，用 AbortController 兜 15 秒。
+async function queryGenericRdap(domain, rdapBase) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  try {
+    // 手动跟随重定向：rdap.org 会 302 跳到具体 TLD 注册局；Cloudflare Workers 用默认
+    // redirect:'follow' 自动跟随「跨站到另一个 Cloudflare 代理站点」的重定向时可能挂起到
+    // 超时，所以这里 redirect:'manual' 自己读 Location 头逐跳跟随（最多 5 跳防循环）。
+    // 直连注册局 RDAP（rdapBase 指定）时通常无重定向，逻辑同样适用。
+    const headers = {
+      'accept': 'application/rdap+json',
+      'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
+    };
+    const base = (rdapBase || 'https://rdap.org').replace(/\/+$/, '');
+    let url = `${base}/domain/${encodeURIComponent(domain)}`;
+    let response;
+    for (let i = 0; i < 5; i++) {
+      response = await fetch(url, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+        redirect: 'manual'
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const loc = response.headers.get('location');
+        if (!loc) break;
+        url = new URL(loc, url).toString();
+        continue;
       }
-    });
+      break;
+    }
+
+    if (response.status === 404) {
+      return {
+        success: true,
+        domain: domain,
+        registered: false,
+        raw: null
+      };
+    }
 
     if (!response.ok) {
-      throw new Error(`API请求失败: ${response.status} ${response.statusText}`);
+      throw new Error(`RDAP查询失败: ${response.status} ${response.statusText}`);
     }
 
     const data = await response.json();
-    
-    // 解析并格式化返回数据
+
+    // 未注册域名 rdap.org 返回 404（上面已处理）；能走到这里且是 domain 对象即已注册
+    const isRegistered = data.objectClassName === 'domain' || !!data.ldhName;
+
+    const getEvent = (action) => {
+      const event = (data.events || []).find(e => e.eventAction === action);
+      return event ? event.eventDate : null;
+    };
+
+    const registrationDate = getEvent('registration');
+    const expiryDate = getEvent('expiration');
+    const lastUpdated = getEvent('last changed') || getEvent('last update of RDAP database');
+
+    // 从 entities 里动态取注册商名称与 URL
+    let registrar = null;
+    let registrarUrl = null;
+    const registrarEntity = (data.entities || []).find(e => (e.roles || []).includes('registrar'));
+    if (registrarEntity) {
+      if (registrarEntity.vcardArray && Array.isArray(registrarEntity.vcardArray[1])) {
+        const fn = registrarEntity.vcardArray[1].find(f => f[0] === 'fn');
+        if (fn) registrar = fn[3];
+        const urlField = registrarEntity.vcardArray[1].find(f => f[0] === 'url');
+        if (urlField) registrarUrl = urlField[3];
+      }
+      // URL 常不在 vcard 而在 links（rel="about" 指向注册商官网）
+      if (!registrarUrl) {
+        const aboutLink = (registrarEntity.links || []).find(l => l.rel === 'about' && l.href);
+        if (aboutLink) registrarUrl = aboutLink.href;
+      }
+    }
+
+    const nameservers = (data.nameservers || []).map(ns => ns.ldhName).filter(Boolean);
+    const statuses = data.status || [];
+
     return {
       success: true,
-      domain: data.name || domain,
-      registered: data.registered || false,
-      registrationDate: data.created ? formatDate(data.created) : null,
-      expiryDate: data.expires ? formatDate(data.expires) : null,
-      lastUpdated: data.changed ? formatDate(data.changed) : null,
-      registrar: data.registrar ? data.registrar.name : null,
-      registrarUrl: data.registrar ? data.registrar.url : null,
-      nameservers: data.nameserver || [],
-      status: data.status || [],
-      dnssec: data.dnssec || null,
-      raw: data // 保留原始数据以备后用
+      domain: data.ldhName || domain,
+      registered: isRegistered,
+      registrationDate: registrationDate ? formatDate(registrationDate) : null,
+      expiryDate: expiryDate ? formatDate(expiryDate) : null,
+      lastUpdated: lastUpdated ? formatDate(lastUpdated) : null,
+      registrar: registrar,
+      registrarUrl: registrarUrl,
+      nameservers: nameservers,
+      status: statuses,
+      dnssec: data.secureDNS ? (data.secureDNS.delegationSigned ? 'signed' : 'unsigned') : null,
+      raw: data
     };
   } catch (error) {
+    const msg = error.name === 'AbortError' ? 'RDAP查询超时（15秒）' : error.message;
+    console.error('一级域名 RDAP 查询失败:', msg);
     return {
       success: false,
-      error: error.message,
+      error: msg,
       domain: domain
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -6165,8 +6388,8 @@ async function handleApiRequest(request) {
         // 使用 DigitalPlat 接口查询特定二级域名
         result = await queryDigitalPlatWhois(domain);
       } else {
-        // 其他域名使用 WhoisJSON API
-        result = await queryDomainWhois(domain);
+        // 一级域名：RDAP 查询（免费无 Key）
+        result = await queryFirstLevelDomain(domain);
       }
       
       return jsonResponse(result);
@@ -7677,11 +7900,6 @@ function getSetupHTML() {
                             <td><code>TG_ID</code></td>
                             <td>Telegram Chat ID</td>
                             <td>123456789</td>
-                        </tr>
-                        <tr>
-                            <td><code>WHOISJSON_API_KEY</code></td>
-                            <td>WhoisJSON API 密钥（用于域名查询）</td>
-                            <td>your_api_key</td>
                         </tr>
                     </tbody>
                 </table>

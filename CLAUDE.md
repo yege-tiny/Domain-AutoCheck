@@ -7,7 +7,7 @@
 - 存储: Cloudflare KV (绑定名: `DOMAIN_MONITOR`)
 - 测试: Vitest（普通 Node 环境，通过 `vitest.config.js` 把 `cloudflare:sockets` 别名到本地 mock）
 - 前端: Bootstrap 5.3 + 原生 JS，全部内嵌在单个 HTML 模板中
-- 外部 API: WhoisJSON API、whois.pp.ua、Gname WHOIS/RDAP（eu.cc）、DigitalPlat WHOIS/RDAP
+- 外部 API: 通用 RDAP（rdap.org，一级域名）、whois.pp.ua、Gname WHOIS/RDAP（eu.cc）、DigitalPlat WHOIS/RDAP
 
 ## 部署约束（重要）
 
@@ -38,7 +38,7 @@
 | 128-249 | **鉴权工具**（HMAC 签名 cookie + 恒定时间比较），主要函数均 `export`<br>· `signSession` / `verifySession` / `readCookie` / `buildSessionCookie` |
 | 245-256 | `getCorrectPassword()` — 默认密码兜底时打 console.warn |
 | 258-283 | `getWhoisQueryFunction()` — 域名查询路由 |
-| 286-332 | `queryDomainWhois()` — 一级域名查询（WhoisJSON API） |
+| 286-332 | `queryFirstLevelDomain()` / `queryGenericRdap()` — 一级域名查询（rdap.org 免费 RDAP，无需 Key） |
 | 335-419 | `queryPpUaWhois()` — pp.ua 域名查询（TCP socket，超时 10 秒） |
 | 422-590 | `queryEuCcWhois()` — eu.cc 域名查询（RDAP 优先 + TCP WHOIS 兜底，超时 30 秒） |
 | 594-764 | `queryDigitalPlatWhois()` — DigitalPlat 域名查询（RDAP + TCP 兜底） |
@@ -95,7 +95,7 @@
 - `.pp.ua` → `queryPpUaWhois`（TCP socket 直连 whois.pp.ua:43，超时 10 秒）
 - `.eu.cc` → `queryEuCcWhois`（RDAP 优先 `rdap.gname.com` + TCP WHOIS 兜底 `whois.gname.com:43`，超时 30 秒）
 - `.qzz.io` / `.dpdns.org` / `.us.kg` / `.xx.kg` → `queryDigitalPlatWhois`（RDAP + TCP 兜底）
-- 一级域名（1个点）且有 API Key → `queryDomainWhois`（WhoisJSON API）
+- 一级域名（1个点）→ `queryFirstLevelDomain`（rdap.org 免费 RDAP，无需 Key）
 - 其他 → 返回 null（不支持）
 
 ### 域名验证逻辑（出现两处，需同步修改）
@@ -117,7 +117,6 @@
 - `DOMAIN_MONITOR` — KV 命名空间绑定（必需）
 - `TOKEN` — 登录密码（默认: `"domain"`，**生产环境必须设置**，否则 HMAC 密钥裸奔）
 - `TG_TOKEN` / `TG_ID` — Telegram 通知配置（可选）
-- `WHOISJSON_API_KEY` — WhoisJSON API 密钥（可选，用于一级域名查询）
 - `SITE_NAME` / `LOGO_URL` / `BACKGROUND_URL` — 自定义外观（可选）
 
 ## API 路由

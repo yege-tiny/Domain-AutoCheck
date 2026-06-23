@@ -18,7 +18,7 @@
 * Cloudflare Workers 部署，零服务器运维
 * Cloudflare KV 持久化存储
 * 支持 Telegram 到期提醒
-* 支持一级域名 WHOIS 自动查询（需 WHOISJSON API）
+* 支持一级域名 WHOIS 自动查询（基于免费 RDAP，无需 API Key）
 * 支持指定二级域名自动查询：`pp.ua`、`us.kg`、`xx.kg`、`qzz.io`、`dpdns.org`、`eu.cc`
 
 ## ✅二级域名自动查询
@@ -124,7 +124,6 @@ Fork 部署可以保持与上游仓库的关联，方便后续通过 **Sync fork
 | SITE_NAME         | 默认为域名到期监控                                                             |  ❌️  | 不填则默认“域名到期监控”                 |
 | LOGO_URL          | https://123abc.com/logo.svg                                                    |  ❌️  | 网站 logo，有需要可自行设置             |
 | BACKGROUND_URL    | https://123abc.com/img.jpg                                                     |  ❌️  | 背景图，有需要可自行设置                 |
-| WHOISJSON_API_KEY | 去 [WHOISJSON](https://whoisjson.com/) 免费注册获取 API，每月免费 1000 次查询 |  ❌️  | 仅支持一级域名的自动查询                 |
 
 ## ♻️代码更新方式
 功能基本稳定，通常只有一些体验类小修复，并不影响整体使用。  
