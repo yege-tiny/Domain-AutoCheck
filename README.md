@@ -1,16 +1,5 @@
 # 🌍 Domain-Autocheck
 
-<details>
-    <summary>更新日志</summary>
-    2025-12-14  
-    1. 系统设置新增默认展开卡片、进度条、卡片布局设置  
-    2. 新增亮色和暗色主题切换  
-    3. 新增 `pp.ua`、`qzz.io`、`dpdns.org`、`xx.kg`、`us.kg`、`eu.cc` 6 个二级域名自动查询（自动填写注册厂商、注册日期、到期日期、续期链接，默认续期周期 1 年）  
-    4. 列表新增分类下拉框过滤，添加域名增加注册账号属性  
-</details>
-
-> 现在除了一级域名配合 apikey 查询之外，新增 `pp.ua`、`qzz.io`、`dpdns.org`、`xx.kg`、`us.kg`、`eu.cc` 这 6 个二级域名时，点击查询后如果不需要填写注册账号和备注，其他信息都会自动填写，可以直接保存。
-
 ## ✨一句话介绍
 部署在 Cloudflare Workers 的轻量级域名到期监控系统，支持 Telegram 通知与自动 WHOIS 填充。
 
